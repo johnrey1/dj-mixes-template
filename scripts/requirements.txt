@@ -1,0 +1,4 @@
+boto3
+mutagen
+python-slugify
+python-dotenv
