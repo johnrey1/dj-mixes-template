@@ -203,6 +203,12 @@ body::before {
   position: relative;
   animation: rise 0.6s ease-out both;
   animation-delay: calc(var(--i, 0) * 70ms + 120ms);
+  box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  transition: box-shadow 0.5s ease;
+}
+
+.mix-track--highlight {
+  box-shadow: 0 0 0 1px var(--accent), 0 0 24px var(--accent-glow);
 }
 
 @keyframes rise {
@@ -310,6 +316,7 @@ body::before {
 
 .mix-track__actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 1.5rem;
   margin-top: 1rem;
@@ -350,6 +357,26 @@ body::before {
 }
 
 .mix-track__download:hover { color: var(--accent); }
+
+.mix-track__share {
+  appearance: none;
+  border: none;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.2s ease;
+}
+
+.mix-track__share:hover { color: var(--accent); }
 
 .mix-track__tracklist {
   margin-top: 1rem;
@@ -430,5 +457,6 @@ body::before {
   .mix-track { padding: 1.75rem 0; }
   .mix-track__row { gap: 0.75rem; }
   .mix-track__title { font-size: 1.15rem; }
+  .mix-track__actions { gap: 0.9rem 1.25rem; }
   .mix-filters { gap: 1.1rem; }
 }
