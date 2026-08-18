@@ -4,6 +4,7 @@
   let currentStopFn = null;
   let allMixes = [];
   let activeFilter = 'all';
+  let autoplayArmed = true;
 
   // Generic fallback — used whenever config.js is missing, fails to load/parse,
   // or is missing individual fields. Deliberately NOT this site's actual branding,
@@ -87,6 +88,17 @@
     currentStopFn = stopFn;
   }
 
+  // Defensive against a play() that throws synchronously instead of
+  // rejecting (not the case for WaveSurfer 7.8.6 / modern <audio>, but
+  // cheap insurance if the CDN version ever drifts).
+  function attemptPlay(fn) {
+    try {
+      Promise.resolve(fn()).catch(() => {});
+    } catch (err) {
+      // autoplay blocked or unsupported — ignore, playback stays manual
+    }
+  }
+
   function formatDuration(totalSeconds) {
     if (!totalSeconds && totalSeconds !== 0) return '';
     const h = Math.floor(totalSeconds / 3600);
@@ -125,10 +137,11 @@
     });
   }
 
-  function buildTrack(mix, index) {
+  function buildTrack(mix, index, autoplay) {
     const track = document.createElement('article');
     track.className = 'mix-track';
     track.style.setProperty('--i', String(index));
+    if (mix.id) track.id = 'mixtrack-' + mix.id;
 
     const row = document.createElement('div');
     row.className = 'mix-track__row';
@@ -185,11 +198,12 @@
     actions.className = 'mix-track__actions';
 
     if (window.WaveSurfer) {
-      attachWaveform(body, actions, mix);
+      attachWaveform(body, actions, mix, autoplay);
     } else {
-      attachNativeAudio(body, mix);
+      attachNativeAudio(body, mix, autoplay);
     }
 
+    actions.appendChild(buildShareLink(mix));
     actions.appendChild(buildDownloadLink(mix));
     body.appendChild(actions);
 
@@ -236,7 +250,39 @@
     return link;
   }
 
-  function attachWaveform(body, actions, mix) {
+  function buildShareLink(mix) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'mix-track__share';
+    btn.textContent = '⛓ copy link';
+    btn.setAttribute('aria-label', `Copy direct link to ${mix.title}`);
+
+    let revertTimer = null;
+
+    btn.addEventListener('click', () => {
+      const u = new URL(location.href);
+      u.search = '';
+      u.hash = '';
+      if (mix.id) u.searchParams.set('mix', mix.id);
+      const url = u.toString();
+
+      const showCopied = () => {
+        clearTimeout(revertTimer);
+        btn.textContent = 'copied!';
+        revertTimer = setTimeout(() => { btn.textContent = '⛓ copy link'; }, 1500);
+      };
+
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        prompt('Copy this link:', url);
+        return;
+      }
+      navigator.clipboard.writeText(url).then(showCopied, () => prompt('Copy this link:', url));
+    });
+
+    return btn;
+  }
+
+  function attachWaveform(body, actions, mix, autoplay) {
     const waveformEl = document.createElement('div');
     waveformEl.className = 'mix-track__waveform';
     body.appendChild(waveformEl);
@@ -272,7 +318,7 @@
     } catch (err) {
       body.removeChild(waveformEl);
       actions.removeChild(playBtn);
-      attachNativeAudio(body, mix);
+      attachNativeAudio(body, mix, autoplay);
       return;
     }
 
@@ -282,7 +328,6 @@
       if (ws.isPlaying()) {
         ws.pause();
       } else {
-        setCurrentPlayer(stop);
         ws.play();
       }
     };
@@ -290,12 +335,26 @@
     waveformEl.addEventListener('click', togglePlay);
     playBtn.addEventListener('click', togglePlay);
 
-    ws.on('play', () => { playBtn.textContent = '❚❚ pause'; });
+    ws.on('play', () => {
+      setCurrentPlayer(stop);
+      playBtn.textContent = '❚❚ pause';
+    });
     ws.on('pause', () => { playBtn.textContent = '▶ play'; });
     ws.on('finish', () => { playBtn.textContent = '▶ play'; });
+
+    if (autoplay) {
+      // `once` + the shared armed-flag make this a one-shot: if the user
+      // manually starts a different track before this mix's audio finishes
+      // loading/decoding, the late `ready` here must not steal playback.
+      ws.once('ready', () => {
+        if (!autoplayArmed) return;
+        autoplayArmed = false;
+        attemptPlay(() => ws.play());
+      });
+    }
   }
 
-  function attachNativeAudio(body, mix) {
+  function attachNativeAudio(body, mix, autoplay) {
     const audio = document.createElement('audio');
     audio.className = 'mix-track__audio-fallback';
     audio.controls = true;
@@ -306,9 +365,18 @@
     audio.addEventListener('play', () => setCurrentPlayer(stop));
 
     body.appendChild(audio);
+
+    if (autoplay && autoplayArmed) {
+      autoplayArmed = false;
+      attemptPlay(() => audio.play());
+    }
   }
 
-  function renderList() {
+  function renderList(targetId) {
+    if (currentStopFn) {
+      currentStopFn();
+      currentStopFn = null;
+    }
     listEl.innerHTML = '';
 
     const filtered = activeFilter === 'all'
@@ -326,7 +394,7 @@
     }
 
     const sorted = [...filtered].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
-    sorted.forEach((mix, index) => listEl.appendChild(buildTrack(mix, index)));
+    sorted.forEach((mix, index) => listEl.appendChild(buildTrack(mix, index, Boolean(targetId) && mix.id === targetId)));
   }
 
   fetch('./mixes.json')
@@ -335,9 +403,26 @@
       return res.json();
     })
     .then((mixes) => {
-      allMixes = mixes;
+      allMixes = Array.isArray(mixes) ? mixes : [];
+
+      const targetId = new URLSearchParams(location.search).get('mix');
+      const targetMix = targetId && allMixes.find((mix) => mix.id === targetId);
+      if (targetMix) activeFilter = 'all';
+
       buildFilters();
-      renderList();
+      renderList(targetMix ? targetId : undefined);
+
+      if (targetMix) {
+        const el = document.getElementById('mixtrack-' + targetMix.id);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.classList.add('mix-track--highlight');
+          setTimeout(() => el.classList.remove('mix-track--highlight'), 2500);
+        }
+        const cleanUrl = new URL(location.href);
+        cleanUrl.searchParams.delete('mix');
+        history.replaceState(null, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
+      }
     })
     .catch((err) => {
       listEl.innerHTML = '';
