@@ -2,3 +2,5 @@ boto3
 mutagen
 python-slugify
 python-dotenv
+numpy
+librosa>=0.10.1

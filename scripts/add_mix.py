@@ -20,6 +20,14 @@ from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
 from slugify import slugify
 
+try:  # DSP for --suggest-timestamps; the tool still runs (energy-only) without it.
+    import numpy as np
+    import librosa
+
+    _HAVE_LIBROSA = True
+except ImportError:  # pragma: no cover - exercised only on a stripped install
+    _HAVE_LIBROSA = False
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIXES_JSON = REPO_ROOT / "site" / "mixes.json"
 
@@ -56,9 +64,12 @@ def parse_args():
         "--suggest-timestamps",
         action="store_true",
         help=(
-            "Propose a start time for each tracklist entry that has no explicit "
-            "timestamp prefix, and write the result into the manifest (review it "
-            "in 'git diff' before pushing). Requires a tracklist in the mp3's USLT tag."
+            "Propose a *rough* start time for each tracklist entry that has no "
+            "explicit timestamp prefix, from a timbre/harmony novelty curve snapped "
+            "to the nearest detected beat, and write it into the manifest. Seamless "
+            "blends can be off by 10-30s - review in 'git diff' before pushing. If "
+            "you have a Rekordbox/Serato/Traktor history export, prefix the tracklist "
+            "with [mm:ss] from that instead. Requires a tracklist in the mp3's USLT tag."
         ),
     )
     parser.add_argument(
@@ -164,9 +175,17 @@ def extract_tracklist(audio):
     return entries
 
 
-DECODE_SAMPLE_RATE = 8000
+DECODE_SAMPLE_RATE = 22050  # chroma needs the bandwidth; peaks are downsampled anyway
 PEAKS_NUM_POINTS = 800
 NOVELTY_BIN_SECONDS = 0.5
+
+# --suggest-timestamps spectral-novelty tuning.
+FEAT_HOP_SECONDS = 1.0        # one feature frame (and one novelty bin) per second
+KERNEL_HALF_SECONDS = 32.0    # checkerboard half-width -> ~64 s window, spans a full blend
+W_SSM = 0.60                  # timbre + harmony change (primary cue)
+W_FLUX = 0.25                 # new spectral content entering under a level-matched blend
+W_ENERGY = 0.15               # keeps the old loudness-rise signal for hard cuts
+BEAT_SNAP_MAX_SECONDS = 4.0   # only snap a guess to a detected beat within this distance
 
 
 def decode_mono_pcm(audio_path: Path, ar: int = DECODE_SAMPLE_RATE):
@@ -215,12 +234,14 @@ def downsample_maxabs(samples, num_points: int):
     return out
 
 
-def _novelty_curve(samples, ar: int = DECODE_SAMPLE_RATE, bin_seconds: float = NOVELTY_BIN_SECONDS):
+def _energy_delta_novelty(samples, ar: int = DECODE_SAMPLE_RATE, bin_seconds: float = NOVELTY_BIN_SECONDS):
     """Positive first difference of a smoothed log-energy envelope.
 
-    Peaks mark moments where loudness rises — a decent proxy for where a new track
-    enters a mix. Returns one value per ``bin_seconds`` window, or None if the
-    audio is too short to analyse."""
+    Peaks mark moments where loudness *rises*. On its own this is a weak boundary
+    cue for beatmatched, gain-matched blends (a good transition holds the level
+    flat), but it still catches hard cuts, so it stays in the hybrid as a minor
+    term — and it is the whole signal when librosa is unavailable. Returns one
+    value per ``bin_seconds`` window, or None if the audio is too short."""
     if not samples:
         return None
     num_bins = max(1, int(len(samples) / (ar * bin_seconds)))
@@ -236,6 +257,130 @@ def _novelty_curve(samples, ar: int = DECODE_SAMPLE_RATE, bin_seconds: float = N
         delta = smooth[i] - smooth[i - 1]
         nov.append(delta if delta > 0 else 0.0)
     return nov
+
+
+def _norm01(a):
+    """Min-max a 1-D array into [0, 1]; all-flat input -> all zeros."""
+    a = np.asarray(a, dtype=float)
+    lo, hi = float(np.min(a)), float(np.max(a))
+    if hi - lo < 1e-12:
+        return np.zeros_like(a)
+    return (a - lo) / (hi - lo)
+
+
+def _resample_curve(curve, n: int):
+    """Linearly resample a 1-D curve to length ``n`` (both endpoints preserved)."""
+    curve = np.asarray(curve, dtype=float)
+    if len(curve) == n:
+        return curve
+    if len(curve) < 2:
+        return np.zeros(n)
+    return np.interp(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, len(curve)), curve)
+
+
+def _spectral_features(y, ar: int, hop: int):
+    """(n_frames, n_feat) frame-normalised MFCC+chroma matrix, one row per ``hop``.
+
+    MFCC captures timbre/instrumentation, chroma captures harmony/key — between
+    them, the cues a listener actually uses to hear a track change under a
+    level-matched blend. Each frame is L2-normalised so ``feat @ feat.T`` is a
+    cosine self-similarity matrix."""
+    mfcc = librosa.feature.mfcc(y=y, sr=ar, hop_length=hop, n_mfcc=13)
+    chroma = librosa.feature.chroma_stft(y=y, sr=ar, hop_length=hop)
+    feat = np.vstack(
+        [librosa.util.normalize(mfcc, axis=1), librosa.util.normalize(chroma, axis=1)]
+    ).T
+    return feat / (np.linalg.norm(feat, axis=1, keepdims=True) + 1e-9)
+
+
+def _checkerboard_novelty(feat, half: int):
+    """Foote (2000) audio-novelty: correlate a Gaussian-tapered checkerboard
+    kernel down the diagonal of the feature self-similarity matrix.
+
+    The score is high where the region *before* a frame is internally similar,
+    the region *after* it is internally similar, and the two are dissimilar —
+    i.e. a structural boundary. ``half`` is the kernel half-width in frames."""
+    ssm = feat @ feat.T
+    idx = np.arange(-half, half + 1)
+    taper = np.exp(-0.5 * (idx / (half / 2.0)) ** 2)
+    kernel = np.outer(np.sign(idx), np.sign(idx)) * np.outer(taper, taper)
+    nov = np.zeros(ssm.shape[0])
+    for i in range(half, ssm.shape[0] - half):
+        nov[i] = np.sum(ssm[i - half : i + half + 1, i - half : i + half + 1] * kernel)
+    nov[nov < 0] = 0.0
+    return nov
+
+
+def _spectral_flux(y, ar: int, hop: int):
+    """Summed positive frame-to-frame spectral increase, with a multi-second lag
+    so it reads as structural change rather than per-kick onset detail."""
+    return librosa.onset.onset_strength(
+        y=y,
+        sr=ar,
+        hop_length=hop,
+        lag=max(1, int(round(2.0 / FEAT_HOP_SECONDS))),
+        aggregate=np.median,
+    )
+
+
+def _novelty_curve(samples, ar: int = DECODE_SAMPLE_RATE, bin_seconds: float = FEAT_HOP_SECONDS):
+    """Per-bin "a new track is entering here" score, one value per ``bin_seconds``.
+
+    Hybrid of an MFCC+chroma checkerboard self-similarity novelty (primary), a
+    lagged spectral-flux term, and the old log-energy delta (hard cuts), each
+    normalised to [0, 1] then weighted. Falls back to the energy delta alone when
+    librosa is missing or the clip is too short for the kernel; None when there is
+    not even enough audio for that. The return contract is unchanged: a list where
+    ``index * bin_seconds`` is the bin's start time."""
+    if not samples:
+        return None
+    if not _HAVE_LIBROSA:
+        return _energy_delta_novelty(samples, ar, NOVELTY_BIN_SECONDS)
+    try:
+        y = np.frombuffer(bytes(samples), dtype=np.int16).astype(np.float32) / 32768.0
+        hop = max(1, int(ar * bin_seconds))
+        half = int(round(KERNEL_HALF_SECONDS / bin_seconds))
+        if len(y) < (2 * half + 1) * hop:  # too short for the checkerboard kernel
+            return _energy_delta_novelty(samples, ar, NOVELTY_BIN_SECONDS)
+        feat = _spectral_features(y, ar, hop)
+        if feat.shape[0] < 2 * half + 1:
+            return _energy_delta_novelty(samples, ar, NOVELTY_BIN_SECONDS)
+        ssm_nov = _norm01(_checkerboard_novelty(feat, half))
+        flux = _norm01(_resample_curve(_spectral_flux(y, ar, hop), len(ssm_nov)))
+        energy = _norm01(
+            _resample_curve(_energy_delta_novelty(samples, ar, bin_seconds) or [0.0], len(ssm_nov))
+        )
+        nov = W_SSM * ssm_nov + W_FLUX * flux + W_ENERGY * energy
+        return [float(v) for v in nov]
+    except Exception as e:  # pragma: no cover - defensive; keep the tool working
+        print(f"Warning: spectral novelty failed ({e}); using energy-only.", file=sys.stderr)
+        return _energy_delta_novelty(samples, ar, NOVELTY_BIN_SECONDS)
+
+
+def _beat_times(y, ar: int):
+    """Detected beat positions in seconds, or None if beat tracking is unavailable."""
+    if not _HAVE_LIBROSA:
+        return None
+    try:
+        _tempo, beats = librosa.beat.beat_track(y=y, sr=ar, units="time")
+        return [float(b) for b in beats]
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _snap_to_beat(base, beats, lower, upper, max_delta: float = BEAT_SNAP_MAX_SECONDS):
+    """Pull ``base`` onto the nearest beat within ``max_delta`` that still sits
+    inside ``(lower, upper)``. No-op when ``beats`` is empty or nothing qualifies.
+
+    Detection accuracy and *perceived* accuracy differ: a suggestion sitting on a
+    beat reads as correct to a DJ even when it is a beat or two off the true
+    mix-in, so this removes sub-beat jitter without claiming more precision."""
+    if not beats:
+        return base
+    best = min(beats, key=lambda b: abs(b - base))
+    if abs(best - base) <= max_delta and lower <= best <= upper:
+        return best
+    return base
 
 
 def _nudge_to_novelty(base, window, lower, upper, novelty, bin_secs):
@@ -263,8 +408,9 @@ def suggest_timestamps(tracklist, duration_seconds, samples, ar: int = DECODE_SA
     {"time_seconds", "title"}). Entries that already carry ``time_seconds`` are
     anchors and are never moved. Each un-anchored run between anchors is placed by
     an even split across that span, then — when ``samples`` is available — each
-    guess is nudged toward a nearby energy transition without crossing a
-    neighbour. Track 1 anchors at 0 when it has no explicit time.
+    guess is nudged toward a nearby timbre/harmony transition (and snapped to the
+    nearest detected beat) without crossing a neighbour. Track 1 anchors at 0 when
+    it has no explicit time.
 
     Returns a list of ``{"time_seconds": int, "title": str}``, strictly ascending.
     Beatmatched blends have no real loudness break, so treat the output as a
@@ -278,6 +424,11 @@ def suggest_timestamps(tracklist, duration_seconds, samples, ar: int = DECODE_SA
     total = float(duration_seconds) if duration_seconds else None
     novelty = _novelty_curve(samples, ar=ar) if samples else None
     bin_secs = (len(samples) / float(ar)) / len(novelty) if novelty else None
+
+    beats = None
+    if samples and _HAVE_LIBROSA:
+        y = np.frombuffer(bytes(samples), dtype=np.int16).astype(np.float32) / 32768.0
+        beats = _beat_times(y, ar)
 
     i = 0
     while i < n:
@@ -301,6 +452,8 @@ def suggest_timestamps(tracklist, duration_seconds, samples, ar: int = DECODE_SA
             upper = right - 1.0 if j < n else right
             if novelty and bin_secs:
                 base = _nudge_to_novelty(base, slot / 2.0, lower, upper, novelty, bin_secs)
+            if beats:
+                base = _snap_to_beat(base, beats, lower, upper)
             times[k] = min(max(base, lower), upper)
         i = j
 
