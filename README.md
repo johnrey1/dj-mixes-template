@@ -22,6 +22,26 @@ scripts/
   r2_config.example.env
 ```
 
+Only `site/config.js`, the `<title>` in `site/index.html`, and `site/mixes.json` are meant to differ from the template — everything else tracks it (see [Using this template](#using-this-template)).
+
+## Using this template
+
+**Get your own copy.** This is a GitHub *template* repo — copy it, don't fork it, and don't add it as a dependency. On GitHub, click **Use this template → Create a new repository**, or:
+
+```bash
+gh repo create <your-repo> --private --template johnrey1/dj-mixes-template --clone
+```
+
+(`--private` or `--public` — pick one; the command needs a visibility flag.) Then work through *Make it yours* below. Every section after this one operates on your own repo.
+
+**Staying current with the template.** Only three files in a live site diverge from the template — `site/config.js`, the `<title>` in `site/index.html`, and `site/mixes.json`. Everything else (`site/app.js`, `site/styles.css`, `scripts/`) is meant to stay identical, so you pick up later fixes and features by overwriting those files:
+
+1. Grab the template fresh — **Code → Download ZIP** on the template repo, or `git clone` it to a separate directory.
+2. Copy `site/app.js`, `site/styles.css`, and `scripts/` over the versions in your repo.
+3. `git diff` to review what changed, then commit.
+
+`site/index.html` rarely changes here; if it does, apply the change by hand so you keep your own `<title>`. Never copy `site/config.js` or `site/mixes.json` from the template — those hold your branding and your mixes.
+
 ## Make it yours
 
 Before doing any Cloudflare setup, customize the branding:
@@ -61,7 +81,7 @@ Before doing any Cloudflare setup, customize the branding:
 
 Cloudflare's dashboard has moved Pages behind a Workers-first flow — it's easy to miss:
 
-1. Push this repo to your own GitHub account.
+1. Push your repo to GitHub (your copy from [Using this template](#using-this-template)).
 2. Cloudflare dashboard → **Workers & Pages** in the sidebar → **Create application**. This opens a "Create a Worker" flow by default — scroll to the bottom and click **"Looking to deploy Pages? Get started"** to reach the actual Pages flow.
 3. **Import an existing Git repository** → connect your GitHub account → select this repo.
 4. Build settings:
