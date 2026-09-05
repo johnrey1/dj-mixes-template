@@ -22,6 +22,20 @@ scripts/
   r2_config.example.env
 ```
 
+Only `site/config.js`, the `<title>` in `site/index.html`, and `site/mixes.json` are meant to differ from the template — everything else tracks it (see [Using this template](#using-this-template)).
+
+## Using this template
+
+Use this repo as a GitHub template (**Use this template → Create a new repository**), or:
+
+```bash
+gh repo create <your-repo> --public --template johnrey1/dj-mixes-template --clone
+```
+
+Then follow *Make it yours* below.
+
+**Updating later.** `site/app.js`, `site/styles.css`, and `scripts/` are meant to stay identical to the template. To pull in fixes, download the template again (**Code → Download ZIP**), copy those paths over yours, then `git diff` and commit. Don't copy `site/config.js`, `site/mixes.json`, or `site/index.html` — those are yours.
+
 ## Make it yours
 
 Before doing any Cloudflare setup, customize the branding:
@@ -61,7 +75,7 @@ Before doing any Cloudflare setup, customize the branding:
 
 Cloudflare's dashboard has moved Pages behind a Workers-first flow — it's easy to miss:
 
-1. Push this repo to your own GitHub account.
+1. Push your repo to GitHub (your copy from [Using this template](#using-this-template)).
 2. Cloudflare dashboard → **Workers & Pages** in the sidebar → **Create application**. This opens a "Create a Worker" flow by default — scroll to the bottom and click **"Looking to deploy Pages? Get started"** to reach the actual Pages flow.
 3. **Import an existing Git repository** → connect your GitHub account → select this repo.
 4. Build settings:
