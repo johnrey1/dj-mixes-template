@@ -211,6 +211,37 @@ class TestNoveltyHelpers:
         assert all(v >= 0.0 for v in out)
 
 
+class TestAssignRun:
+    def test_falls_back_to_even_split_without_a_curve(self):
+        assert add_mix._assign_run(3, 0.0, 400.0, True, None, None) == [100.0, 200.0, 300.0]
+
+    def test_one_peak_per_track_when_peaks_are_clear(self):
+        nov = [0.0] * 900
+        for p in (100, 400, 700):
+            nov[p] = 1.0
+        picks = add_mix._assign_run(3, 0.0, 900.0, True, nov, 1.0)
+        assert [round(p) for p in picks] == [100, 400, 700]
+
+    def test_adjacent_tracks_do_not_collapse_onto_one_peak(self):
+        # One dominant spike at 300 s, 2 tracks (even split 200 / 400). The greedy
+        # nudger drove both guesses onto 300; the DP keeps them a slot apart.
+        nov = [0.0] * 600
+        nov[300] = 1.0
+        picks = add_mix._assign_run(2, 0.0, 600.0, True, nov, 1.0)
+        assert picks[0] < picks[1]
+        assert picks[1] - picks[0] >= add_mix.NUDGE_MIN_GAP_FLOOR
+
+    def test_result_is_monotonic_with_many_tracks_and_sparse_peaks(self):
+        nov = [0.0] * 1200
+        for p in (150, 155, 160, 900):  # a cluster early, one late, nothing between
+            nov[p] = 1.0
+        picks = add_mix._assign_run(6, 0.0, 1200.0, True, nov, 1.0)
+        assert picks == sorted(picks)
+        assert len(set(round(p) for p in picks)) == 6
+        gaps = [b - a for a, b in zip(picks, picks[1:])]
+        assert min(gaps) >= add_mix.NUDGE_MIN_GAP_FLOOR
+
+
 class TestSnapToBeat:
     def test_snaps_to_nearest_beat_within_tolerance(self):
         beats = [0.0, 2.0, 4.0, 6.0, 8.0]

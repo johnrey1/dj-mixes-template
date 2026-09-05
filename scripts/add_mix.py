@@ -187,6 +187,13 @@ W_FLUX = 0.25                 # new spectral content entering under a level-matc
 W_ENERGY = 0.15               # keeps the old loudness-rise signal for hard cuts
 BEAT_SNAP_MAX_SECONDS = 4.0   # only snap a guess to a detected beat within this distance
 
+# Assigning the novelty peaks to un-anchored tracks (global DP, see _assign_run).
+NUDGE_MIN_GAP_FRAC = 0.4      # adjacent suggestions must be >= this * even-split slot apart
+NUDGE_MIN_GAP_FLOOR = 12.0    # ...but always allow spacing down to this many seconds
+NUDGE_MIN_GAP_CEILING = 75.0  # ...and never demand more than this many seconds
+NUDGE_DEV_PENALTY = 0.4       # cost, per even-split slot of deviation, in [0,1] peak-strength units
+NUDGE_MAX_DEV_FRAC = 1.0      # hard cap: a pick may not stray more than this * slot from its even split
+
 
 def decode_mono_pcm(audio_path: Path, ar: int = DECODE_SAMPLE_RATE):
     """Decode audio to a mono signed-16-bit PCM sample array via ffmpeg.
@@ -383,22 +390,91 @@ def _snap_to_beat(base, beats, lower, upper, max_delta: float = BEAT_SNAP_MAX_SE
     return base
 
 
-def _nudge_to_novelty(base, window, lower, upper, novelty, bin_secs):
-    """Return the time of the strongest novelty spike within ``base ± window``,
-    constrained to ``(lower, upper)``. Falls back to ``base`` when nothing stands out."""
-    lo_t = max(lower, base - window)
-    hi_t = min(upper, base + window)
-    if hi_t <= lo_t:
-        return base
-    lo_b = max(0, int(lo_t / bin_secs))
-    hi_b = min(len(novelty) - 1, int(hi_t / bin_secs))
-    best_b, best_v = None, 0.0
+def _novelty_peaks(novelty, bin_secs, lo_t, hi_t):
+    """Local maxima of ``novelty`` strictly inside ``(lo_t, hi_t)`` as
+    ``(time_seconds, strength)`` pairs. ``strength`` is the raw novelty value."""
+    if not novelty or not bin_secs:
+        return []
+    lo_b = max(1, int(lo_t / bin_secs))
+    hi_b = min(len(novelty) - 2, int(hi_t / bin_secs))
+    peaks = []
     for b in range(lo_b, hi_b + 1):
-        if novelty[b] > best_v:
-            best_v, best_b = novelty[b], b
-    if best_b is None:
-        return base
-    return (best_b + 0.5) * bin_secs
+        v = novelty[b]
+        if v > 0.0 and v >= novelty[b - 1] and v >= novelty[b + 1]:
+            peaks.append(((b + 0.5) * bin_secs, float(v)))
+    return peaks
+
+
+def _assign_run(m, left, right, at_end, novelty, bin_secs):
+    """Place ``m`` un-anchored tracks in the open span ``(left, right)``.
+
+    Chooses a strictly increasing, one-per-track subsequence of novelty peaks that
+    maximises total peak strength minus a penalty for straying from the even-split
+    position, subject to a minimum spacing between neighbours. This is global
+    (dynamic programming over the whole run) rather than a per-track local search:
+    the greedy version let two adjacent guesses collapse onto the same transition
+    and stranded the tracks between the next pair of peaks. Every even-split
+    position is also a (near-zero weight) candidate, so a track with no nearby peak
+    still lands sensibly. Falls back to the plain even split with no usable curve.
+
+    Returns a list of ``m`` floats (seconds), strictly ascending.
+    """
+    slot = (right - left) / (m + 1)
+    even = [left + slot * (k + 1) for k in range(m)]
+    if m == 0 or not novelty or not bin_secs:
+        return even
+
+    span_lo, span_hi = left + 1.0, (right if at_end else right - 1.0)
+    cand = {}
+    for t, w in _novelty_peaks(novelty, bin_secs, span_lo, span_hi):
+        key = round(t, 3)
+        cand[key] = max(cand.get(key, 0.0), w)
+    peak_max = max(cand.values()) if cand else 1.0
+    for e in even:
+        cand.setdefault(round(min(max(e, span_lo), span_hi), 3), 0.0)
+
+    pos = sorted(cand)
+    wt = [cand[p] / peak_max for p in pos]  # peak strengths normalised to [0, 1]
+    C = len(pos)
+    min_gap = min(NUDGE_MIN_GAP_CEILING, max(NUDGE_MIN_GAP_FLOOR, NUDGE_MIN_GAP_FRAC * slot))
+    max_dev = NUDGE_MAX_DEV_FRAC * slot
+
+    def score(k, c):
+        """Weighted value of putting track ``k`` at candidate ``c``, or None if it
+        would stray past the hard deviation cap."""
+        dev = abs(pos[c] - even[k])
+        if dev > max_dev:
+            return None
+        return wt[c] - NUDGE_DEV_PENALTY * dev / slot
+
+    NEG = float("-inf")
+    dp = [[NEG] * C for _ in range(m)]
+    back = [[-1] * C for _ in range(m)]
+    for c in range(C):
+        s = score(0, c)
+        if s is not None:
+            dp[0][c] = s
+    for k in range(1, m):
+        best_prev, best_c, c2 = NEG, -1, 0
+        for c in range(C):
+            while c2 < C and pos[c] - pos[c2] >= min_gap:
+                if dp[k - 1][c2] > best_prev:
+                    best_prev, best_c = dp[k - 1][c2], c2
+                c2 += 1
+            s = score(k, c)
+            if best_c >= 0 and s is not None:
+                dp[k][c] = best_prev + s
+                back[k][c] = best_c
+
+    last = max(range(C), key=lambda c: dp[m - 1][c])
+    if dp[m - 1][last] == NEG:  # span too tight for m tracks at min_gap — shouldn't happen
+        return even
+    picks = [0.0] * m
+    c = last
+    for k in range(m - 1, -1, -1):
+        picks[k] = pos[c]
+        c = back[k][c]
+    return picks
 
 
 def suggest_timestamps(tracklist, duration_seconds, samples, ar: int = DECODE_SAMPLE_RATE):
@@ -406,11 +482,12 @@ def suggest_timestamps(tracklist, duration_seconds, samples, ar: int = DECODE_SA
 
     ``tracklist`` is the list returned by ``extract_tracklist`` (str |
     {"time_seconds", "title"}). Entries that already carry ``time_seconds`` are
-    anchors and are never moved. Each un-anchored run between anchors is placed by
-    an even split across that span, then — when ``samples`` is available — each
-    guess is nudged toward a nearby timbre/harmony transition (and snapped to the
-    nearest detected beat) without crossing a neighbour. Track 1 anchors at 0 when
-    it has no explicit time.
+    anchors and are never moved. Each un-anchored run between anchors starts from an
+    even split across that span; then — when ``samples`` is available — the whole
+    run is fitted at once (``_assign_run``) to the strongest one-per-track
+    subsequence of timbre/harmony-novelty peaks, keeping a minimum spacing so
+    neighbours can't collapse onto one transition, and each result is snapped to
+    the nearest detected beat. Track 1 anchors at 0 when it has no explicit time.
 
     Returns a list of ``{"time_seconds": int, "title": str}``, strictly ascending.
     Beatmatched blends have no real loudness break, so treat the output as a
@@ -439,22 +516,26 @@ def suggest_timestamps(tracklist, duration_seconds, samples, ar: int = DECODE_SA
         while j < n and times[j] is None:
             j += 1
         left = times[i - 1]
-        if j < n:
+        at_end = j >= n
+        if not at_end:
             right = times[j]
         elif total is not None:
             right = total
         else:
             right = left + (j - i + 1) * 60.0
-        slot = (right - left) / (j - i + 1)
-        for k in range(i, j):
-            base = left + slot * (k - i + 1)
-            lower = times[k - 1] + 1.0
-            upper = right - 1.0 if j < n else right
-            if novelty and bin_secs:
-                base = _nudge_to_novelty(base, slot / 2.0, lower, upper, novelty, bin_secs)
+
+        picks = _assign_run(j - i, left, right, at_end, novelty, bin_secs)
+        prev_t = times[i - 1]
+        for k, base in zip(range(i, j), picks):
+            lower = prev_t + 1.0
+            upper = right if at_end else right - 1.0
             if beats:
                 base = _snap_to_beat(base, beats, lower, upper)
-            times[k] = min(max(base, lower), upper)
+            t = min(max(base, lower), upper)
+            if t <= prev_t:
+                t = prev_t + 1.0
+            times[k] = t
+            prev_t = t
         i = j
 
     out = []

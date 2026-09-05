@@ -7,8 +7,13 @@ Research notes for `--suggest-timestamps` in [`scripts/add_mix.py`](../scripts/a
 > novelty** (hybrid-summed with spectral flux and the old energy delta), bump the
 > shared decode to 22.05 kHz, snap each suggestion to the nearest detected beat,
 > and reframe the output as a rough draft — now ships in `add_mix.py` on the
-> **librosa** path (Appendix C). The optional `--identify` fingerprinting mode
-> (§4.4) is still not built. The rest of this document is kept as the rationale.
+> **librosa** path (Appendix C). The per-track greedy nudge (`_nudge_to_novelty`)
+> that followed it was also replaced with a **global peak assignment**
+> (`_assign_run`, §4.1): a DP that fits the whole un-anchored run to a
+> one-peak-per-track subsequence with a minimum spacing, because the greedy
+> version let two adjacent guesses collapse onto the same transition. The optional
+> `--identify` fingerprinting mode (§4.4) is still not built. The rest of this
+> document is kept as the rationale.
 
 ---
 
@@ -71,7 +76,7 @@ signal than `log-energy delta`.
 | Is a better signal than loudness-delta available? | **Yes.** Spectral flux, and especially an **MFCC + chroma self-similarity "checkerboard" novelty** (Foote 2000), are the standard, well-understood tools and are robust to level-matching. |
 | Will it hit the exact second? | **No.** Human annotators disagree by **~9 s (std)** on mix boundaries; the best published unsupervised methods report results that are *usable*, not second-accurate; even methods that align against the original tracks show ~5–14 s median error. |
 | Is there a genuinely accurate route? | Only two: (a) the DJ's own software history export (Rekordbox / Serato / Traktor already logged every track load with a timestamp), or (b) **audio fingerprinting against a reference library** — accurate *and* gives the track identity, but online, quota-bound, and blind to unreleased / white-label / edited / self-produced tracks. |
-| Recommended change to the script | Replace the log-energy delta inside `_novelty_curve` with a **combined MFCC+chroma checkerboard-novelty curve** (optionally summed with the existing energy novelty as a hybrid). Keep `_nudge_to_novelty` and the even-split fallback **unchanged**. Bump the shared decode to 22 kHz. Add **NumPy** (not librosa) as the one new dependency, or hand-roll the STFT. Reframe the output in help text and README as a *rough draft to hand-correct*, never ground truth. |
+| Recommended change to the script | Replace the log-energy delta inside `_novelty_curve` with a **combined MFCC+chroma checkerboard-novelty curve** (summed with the existing energy novelty as a hybrid); bump the shared decode to 22 kHz; keep the even-split fallback. *(Follow-up, now also done: the greedy `_nudge_to_novelty` placement was replaced with a per-run DP peak assignment, `_assign_run` — Appendix E — so adjacent tracks can't collapse onto one peak.)* Reframe the output in help text and README as a *rough draft to hand-correct*, never ground truth. |
 | Not worth doing | `aubio` (onsets aren't boundary-selective + install pain); `madmom` as a core dependency (heavy, for a marginal downbeat-snap nicety); `essentia` `SBic` (well-suited algorithm, worst install friction of the group). |
 
 The recommendation is deliberately conservative: **the change is worth making because
@@ -183,8 +188,14 @@ in the context of a DJ mix** — "usable," explicitly not sample-accurate. Refer
 implementation: `github.com/ecsplendid/DanceMusicSegmentation`.
 
 Takeaway for us: the SSM idea in §3.2 plus a **global DP** over the whole mix (instead of
-the current greedy per-gap nudge) is the state of the art for the no-reference case. DP
-is a realistic future step but a larger change than swapping the novelty curve.
+a greedy per-gap nudge) is the state of the art for the no-reference case. `add_mix.py`
+now does a scoped version of this — `_assign_run` runs a DP *per un-anchored run* (not
+over the whole mix): candidates are the novelty local maxima plus the even-split
+positions, and it picks the strictly-increasing, one-per-track subsequence that maximises
+summed peak strength minus a deviation penalty, subject to a minimum inter-track gap
+(`NUDGE_MIN_GAP_*`) and a hard cap on how far any pick may stray from its even-split slot
+(`NUDGE_MAX_DEV_FRAC`). A full mix-wide DP with long-range self-similarity is still a
+larger future step.
 
 ### 4.2 Mix-to-track subsequence alignment (needs the source tracks)
 
@@ -343,10 +354,11 @@ A local DSP-only script cannot beat those numbers and should not imply that it d
 
 1. **Make the swap (§3.2 + §6.1).** Replace the log-energy delta in `_novelty_curve` with
    a combined MFCC+chroma checkerboard novelty (hybrid-summed with the existing energy
-   novelty). This is a contained change: same function boundary, same
-   `_nudge_to_novelty`, same even-split fallback. It moves the tool from "detecting the
-   wrong thing" to "detecting the right thing, roughly." Add **NumPy** as the one new
-   dependency, or hand-roll the STFT to stay at zero.
+   novelty), keeping the same function boundary and the even-split fallback. It moves the
+   tool from "detecting the wrong thing" to "detecting the right thing, roughly." Add
+   **NumPy** as the one new dependency, or hand-roll the STFT to stay at zero. *(Then
+   replace the greedy per-track `_nudge_to_novelty` with the per-run DP of Appendix E, or
+   two adjacent tracks will still collapse onto one strong peak.)*
 
 2. **Bump the shared decode to 22 kHz** in `decode_mono_pcm`. Waveform peaks are
    unaffected (they are downsampled anyway); chroma needs it.
@@ -377,8 +389,9 @@ The librosa variant (**C**) is what shipped, with three differences from the ske
 below: `chroma_stft` is used instead of `chroma_cqt` (arbitrary hop length), the
 energy delta is kept as a third hybrid term at weight `0.15` (not dropped), and the
 downbeat snap (**D**) is a nearest-*beat* snap via `librosa.beat.beat_track` (no
-`madmom`). Interfaces match the existing code, so `_nudge_to_novelty`,
-`suggest_timestamps`, and the even-split fallback are untouched.
+`madmom`). `_novelty_curve` keeps its old contract (an opaque per-bin array), but the
+consumer changed: `_nudge_to_novelty`'s per-track local search was replaced with
+`_assign_run` (**E**), a per-run DP over the novelty peaks.
 
 ### A. Decode change
 
@@ -450,9 +463,8 @@ def _novelty_curve(samples, ar=DECODE_SAMPLE_RATE, bin_seconds=FEAT_HOP_SECONDS)
     return list(nov)
 ```
 
-`_nudge_to_novelty`, `suggest_timestamps`, `bin_secs` derivation, and the even-split
-fallback stay **exactly as they are** — they already treat the novelty array as an
-opaque per-bin signal.
+`suggest_timestamps` and the `bin_secs` derivation stay as they are — they treat the
+novelty array as an opaque per-bin signal — but the placement step is now **E**.
 
 ### C. If librosa is acceptable instead of hand-rolling B
 
@@ -477,12 +489,37 @@ def _novelty_curve(samples, ar=DECODE_SAMPLE_RATE, bin_seconds=1.0):
 ### D. Optional downbeat snap (needs a beat tracker)
 
 ```python
-# after _nudge_to_novelty in suggest_timestamps:
+# after the novelty placement in suggest_timestamps:
 #   downbeats = beat_tracker(samples, ar)          # librosa.beat.beat_track or madmom DBN
 #   t = min(downbeats, key=lambda d: abs(d - t))   # only if |d - t| < ~4 s
 ```
 
-### E. Docs / help-text change (the important non-code part)
+### E. Global peak assignment — `_assign_run` (replaces the per-track nudge)
+
+The greedy `_nudge_to_novelty` moved each track independently to the strongest
+novelty peak within `± half a slot`. Two adjacent tracks could both reach the same
+strong peak and collapse to ~1 s apart, while the tracks between the *next* pair of
+peaks were stranded. `_assign_run` fixes this by placing the whole un-anchored run
+at once:
+
+```
+candidates      = novelty local maxima in the span   (weight = peak strength, 0..1)
+                ∪ the even-split positions            (weight ≈ 0 — always available)
+min_gap         = clamp(NUDGE_MIN_GAP_FRAC * slot, NUDGE_MIN_GAP_FLOOR, …CEILING)
+max_dev         = NUDGE_MAX_DEV_FRAC * slot           # hard cap on |pick − even_k|
+
+# DP over candidates sorted by time; dp[k][c] = best total score with track k at
+# candidate c, track k−1 at some c′ with pos[c] − pos[c′] ≥ min_gap:
+dp[k][c] = max over valid c′ of  dp[k−1][c′]
+         + weight[c] − NUDGE_DEV_PENALTY * |pos[c] − even_k| / slot      # skip if |·| > max_dev
+```
+
+Back-track from `argmax dp[m−1][·]` for a strictly-increasing, one-peak-per-track
+assignment. Then each pick is beat-snapped (**D**) and clamped between neighbours as
+before. With no usable novelty curve it returns the plain even split. `m ≤ ~15` and a
+handful of candidates per run, so the DP is negligible.
+
+### F. Docs / help-text change (the important non-code part)
 
 - `--suggest-timestamps` help: "Proposes a **rough** start time per track from a
   timbre/harmony novelty curve. Seamless blends can be off by 10–30 s — review and
