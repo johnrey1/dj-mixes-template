@@ -423,7 +423,8 @@ body::before {
 .mix-track__tracklist li {
   counter-increment: track;
   display: flex;
-  gap: 0.75rem;
+  align-items: baseline;
+  gap: 0.55rem 0.7rem;
   font-size: 0.8rem;
   color: var(--muted);
   line-height: 1.5;
@@ -436,6 +437,57 @@ body::before {
   font-size: 0.72rem;
   color: var(--muted-dim);
   padding-top: 0.05em;
+}
+
+/* ---- tracklist timestamps ---- */
+
+.mix-track__ts {
+  appearance: none;
+  border: none;
+  background: transparent;
+  flex: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  cursor: pointer;
+  transition: opacity 0.2s ease;
+}
+
+.mix-track__ts:hover,
+.mix-track__ts:focus-visible {
+  opacity: 0.65;
+}
+
+.mix-track__ts-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.mix-track__ts-copy {
+  appearance: none;
+  border: none;
+  background: transparent;
+  flex: none;
+  margin-left: auto;
+  padding: 0 0.2rem;
+  font-size: 0.78rem;
+  line-height: 1;
+  color: var(--muted-dim);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+.mix-track__tracklist li:hover .mix-track__ts-copy,
+.mix-track__ts-copy:hover,
+.mix-track__ts-copy:focus-visible {
+  color: var(--accent);
+}
+
+.mix-track__ts-copy.is-copied {
+  color: var(--accent);
 }
 
 /* ---------- footer ---------- */

@@ -6,6 +6,11 @@
   let activeFilter = 'all';
   let autoplayArmed = true;
 
+  // Per-mix playback handles for the currently rendered list — { seek, play }.
+  // Keyed by mix.id, rebuilt on every renderList(); lets a tracklist row or a
+  // ?t= deep link drive whichever player (waveform or native <audio>) that mix got.
+  const controllers = new Map();
+
   // Generic fallback — used whenever config.js is missing, fails to load/parse,
   // or is missing individual fields. Deliberately NOT this site's actual branding,
   // so a broken config.js never leaks personal branding into a shared/public copy
@@ -109,6 +114,40 @@
     return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
   }
 
+  // Accepts an integer number of seconds ("754") or a clock string ("12:34",
+  // "1:02:05"). Returns seconds, or null when there's nothing usable. 0 is valid.
+  function parseTimeParam(raw) {
+    if (raw == null) return null;
+    const str = String(raw).trim();
+    if (/^\d+$/.test(str)) return parseInt(str, 10);
+    const m = str.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (!m) return null;
+    const a = parseInt(m[1], 10);
+    const b = parseInt(m[2], 10);
+    return m[3] != null ? a * 3600 + b * 60 + parseInt(m[3], 10) : a * 60 + b;
+  }
+
+  // Direct link to a mix, optionally to a point in it (?mix=<id>&t=<seconds>).
+  function mixLink(mixId, tSeconds) {
+    const u = new URL(location.href);
+    u.search = '';
+    u.hash = '';
+    if (mixId) u.searchParams.set('mix', mixId);
+    if (tSeconds != null) u.searchParams.set('t', String(Math.max(0, Math.round(tSeconds))));
+    return u.toString();
+  }
+
+  function copyLink(url, onCopied) {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      prompt('Copy this link:', url);
+      return;
+    }
+    navigator.clipboard.writeText(url).then(
+      () => { if (onCopied) onCopied(); },
+      () => prompt('Copy this link:', url),
+    );
+  }
+
   function formatDate(dateStr) {
     const d = new Date(dateStr + 'T00:00:00');
     if (isNaN(d)) return dateStr;
@@ -197,18 +236,17 @@
     const actions = document.createElement('div');
     actions.className = 'mix-track__actions';
 
-    if (window.WaveSurfer) {
-      attachWaveform(body, actions, mix, autoplay);
-    } else {
-      attachNativeAudio(body, mix, autoplay);
-    }
+    const controller = window.WaveSurfer
+      ? attachWaveform(body, actions, mix, autoplay)
+      : attachNativeAudio(body, mix, autoplay);
+    if (mix.id && controller) controllers.set(mix.id, controller);
 
     actions.appendChild(buildShareLink(mix));
     actions.appendChild(buildDownloadLink(mix));
     body.appendChild(actions);
 
     if (Array.isArray(mix.tracklist) && mix.tracklist.length) {
-      body.appendChild(buildTracklist(mix));
+      body.appendChild(buildTracklist(mix, controller));
     }
 
     row.appendChild(body);
@@ -217,7 +255,7 @@
     return track;
   }
 
-  function buildTracklist(mix) {
+  function buildTracklist(mix, controller) {
     const details = document.createElement('details');
     details.className = 'mix-track__tracklist';
 
@@ -231,9 +269,48 @@
     details.appendChild(summary);
 
     const ol = document.createElement('ol');
-    mix.tracklist.forEach((track) => {
+    mix.tracklist.forEach((entry) => {
+      const item = (entry && typeof entry === 'object') ? entry : { title: String(entry) };
+      const hasTime = typeof item.time_seconds === 'number' && isFinite(item.time_seconds);
       const li = document.createElement('li');
-      li.textContent = track;
+
+      if (hasTime && controller) {
+        const clock = formatDuration(item.time_seconds);
+
+        const jump = document.createElement('button');
+        jump.type = 'button';
+        jump.className = 'mix-track__ts';
+        jump.textContent = clock;
+        jump.setAttribute('aria-label', `Play ${item.title} from ${clock}`);
+        jump.addEventListener('click', () => {
+          controller.seek(item.time_seconds);
+          controller.play();
+        });
+        li.appendChild(jump);
+
+        const label = document.createElement('span');
+        label.className = 'mix-track__ts-title';
+        label.textContent = item.title;
+        li.appendChild(label);
+
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.className = 'mix-track__ts-copy';
+        copy.textContent = '⛓';
+        copy.setAttribute('aria-label', `Copy link to ${item.title} at ${clock}`);
+        let revert = null;
+        copy.addEventListener('click', () => {
+          copyLink(mixLink(mix.id, item.time_seconds), () => {
+            clearTimeout(revert);
+            copy.classList.add('is-copied');
+            revert = setTimeout(() => copy.classList.remove('is-copied'), 1500);
+          });
+        });
+        li.appendChild(copy);
+      } else {
+        li.textContent = item.title;
+      }
+
       ol.appendChild(li);
     });
     details.appendChild(ol);
@@ -260,23 +337,11 @@
     let revertTimer = null;
 
     btn.addEventListener('click', () => {
-      const u = new URL(location.href);
-      u.search = '';
-      u.hash = '';
-      if (mix.id) u.searchParams.set('mix', mix.id);
-      const url = u.toString();
-
-      const showCopied = () => {
+      copyLink(mixLink(mix.id, null), () => {
         clearTimeout(revertTimer);
         btn.textContent = 'copied!';
         revertTimer = setTimeout(() => { btn.textContent = '⛓ copy link'; }, 1500);
-      };
-
-      if (!navigator.clipboard || !navigator.clipboard.writeText) {
-        prompt('Copy this link:', url);
-        return;
-      }
-      navigator.clipboard.writeText(url).then(showCopied, () => prompt('Copy this link:', url));
+      });
     });
 
     return btn;
@@ -318,9 +383,31 @@
     } catch (err) {
       body.removeChild(waveformEl);
       actions.removeChild(playBtn);
-      attachNativeAudio(body, mix, autoplay);
-      return;
+      return attachNativeAudio(body, mix, autoplay);
     }
+
+    const clampTime = (t) => {
+      const dur = ws.getDuration() || mix.duration_seconds || 0;
+      const hi = dur > 0 ? dur - 0.25 : t;
+      return Math.min(Math.max(0, t), hi < 0 ? 0 : hi);
+    };
+
+    // A seek issued before the media is loaded is dropped by the browser, so
+    // hold the request and (re)apply it once WaveSurfer reports a duration —
+    // 'ready' is the reliable point. The immediate call is best-effort for the
+    // common peaks-provided case where duration is already known.
+    let pendingSeek = null;
+    const applySeek = () => {
+      if (pendingSeek == null || !(ws.getDuration() > 0)) return;
+      ws.setTime(clampTime(pendingSeek));
+    };
+    ws.on('ready', () => { applySeek(); pendingSeek = null; });
+
+    const seek = (t) => {
+      if (typeof t !== 'number' || !isFinite(t)) return;
+      pendingSeek = t;
+      applySeek();
+    };
 
     const stop = () => ws.pause();
 
@@ -352,6 +439,8 @@
         attemptPlay(() => ws.play());
       });
     }
+
+    return { seek, play: () => ws.play() };
   }
 
   function attachNativeAudio(body, mix, autoplay) {
@@ -370,6 +459,36 @@
       autoplayArmed = false;
       attemptPlay(() => audio.play());
     }
+
+    const clampTime = (t) => {
+      const dur = audio.duration || mix.duration_seconds || 0;
+      const hi = dur > 0 ? dur - 0.25 : t;
+      return Math.min(Math.max(0, t), hi < 0 ? 0 : hi);
+    };
+
+    // currentTime is ignored until metadata loads; preload='none' means that
+    // never happens on its own, so bump preload + load() and finish the seek
+    // on 'loadedmetadata'.
+    let pendingSeek = null;
+    const applySeek = () => {
+      if (pendingSeek == null || audio.readyState < 1) return;
+      audio.currentTime = clampTime(pendingSeek);
+      pendingSeek = null;
+    };
+    audio.addEventListener('loadedmetadata', applySeek);
+
+    const seek = (t) => {
+      if (typeof t !== 'number' || !isFinite(t)) return;
+      pendingSeek = t;
+      if (audio.readyState >= 1) {
+        applySeek();
+      } else {
+        if (audio.preload === 'none') audio.preload = 'metadata';
+        audio.load();
+      }
+    };
+
+    return { seek, play: () => audio.play() };
   }
 
   function renderList(targetId) {
@@ -377,6 +496,7 @@
       currentStopFn();
       currentStopFn = null;
     }
+    controllers.clear();
     listEl.innerHTML = '';
 
     const filtered = activeFilter === 'all'
@@ -405,7 +525,9 @@
     .then((mixes) => {
       allMixes = Array.isArray(mixes) ? mixes : [];
 
-      const targetId = new URLSearchParams(location.search).get('mix');
+      const params = new URLSearchParams(location.search);
+      const targetId = params.get('mix');
+      const startAt = parseTimeParam(params.get('t'));
       const targetMix = targetId && allMixes.find((mix) => mix.id === targetId);
       if (targetMix) activeFilter = 'all';
 
@@ -419,8 +541,20 @@
           el.classList.add('mix-track--highlight');
           setTimeout(() => el.classList.remove('mix-track--highlight'), 2500);
         }
+
+        if (startAt != null) {
+          const controller = controllers.get(targetMix.id);
+          if (controller) {
+            controller.seek(startAt);
+            attemptPlay(() => controller.play());
+          }
+          const tl = el && el.querySelector('.mix-track__tracklist');
+          if (tl) tl.open = true;
+        }
+
         const cleanUrl = new URL(location.href);
         cleanUrl.searchParams.delete('mix');
+        cleanUrl.searchParams.delete('t');
         history.replaceState(null, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
       }
     })
