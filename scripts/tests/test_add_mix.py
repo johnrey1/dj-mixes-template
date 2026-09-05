@@ -8,6 +8,8 @@ it here is side-effect free.
 import array
 import math
 
+import pytest
+
 import add_mix
 
 
@@ -146,23 +148,112 @@ class TestSuggestTimestamps:
         out = add_mix.suggest_timestamps(["A", "B", "C", "D", "E"], 3, None)
         assert _secs(out) == sorted(set(_secs(out)))
 
-    def test_novelty_nudges_guesses_toward_real_onsets(self):
-        ar = 2000
-        track_len = 60          # seconds
-        onset_in_track = 8      # loudness jumps 8s into each track
-        samples = array.array("h")
-        for t in range(4):
-            for s in range(track_len * ar):
-                sec = s / ar
-                amp = 12000 if sec >= onset_in_track else 200
-                samples.append(int(amp * math.sin(2 * math.pi * 220 * sec)))
+    def test_novelty_nudges_guesses_toward_real_spectral_transitions(self):
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("librosa")
 
-        out = add_mix.suggest_timestamps(["A", "B", "C", "D"], 4 * track_len, samples, ar=ar)
+        ar = 22050
+        track_len = 45          # seconds per track slot
+        shift_in_track = 8      # the timbre/pitch flips 8s into each slot
+        n_tracks = 4
+        total = n_tracks * track_len
+
+        # Each slot k plays a distinct fundamental (180/270/360/450 Hz — different
+        # pitch classes), but for the first `shift_in_track` seconds it still
+        # carries the *previous* slot's tone, so the real transition sits 8s past
+        # the even-split boundary. A quiet 120 BPM click keeps beat tracking honest.
+        t = np.arange(total * ar) / ar
+        slot = np.minimum((t // track_len).astype(int), n_tracks - 1)
+        into = t - slot * track_len
+        tone_idx = np.where(into >= shift_in_track, slot, np.maximum(slot - 1, 0))
+        freq = 180.0 + 90.0 * tone_idx
+        sig = 9000.0 * np.sin(2 * np.pi * freq * t)
+        sig += np.where(np.arange(t.size) % (ar // 2) < 40, 8000.0, 0.0)
+        sig = np.clip(sig, -32000, 32000).astype(np.int16)
+        samples = array.array("h", sig.tobytes())
+
+        out = add_mix.suggest_timestamps(["A", "B", "C", "D"], total, samples, ar=ar)
         secs = _secs(out)
 
         assert secs[0] == 0                     # first track pinned
         assert secs == sorted(secs)
-        # Even split would give 60/120/180; real onsets are 68/128/188.
-        for guess, onset in zip(secs[1:], [68, 128, 188]):
-            assert abs(guess - onset) < 20
-            assert abs(guess - onset) < abs(guess - (onset - onset_in_track))
+        # Even split gives 45/90/135; the real transitions are at 53/98/143.
+        for guess, transition, boundary in zip(secs[1:], [53, 98, 143], [45, 90, 135]):
+            assert abs(guess - transition) < 20
+            assert abs(guess - transition) < abs(guess - boundary)
+
+
+class TestNoveltyHelpers:
+    def test_checkerboard_novelty_peaks_at_segment_boundary(self):
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("librosa")
+
+        rng = np.random.default_rng(0)
+        a = rng.normal(size=(1, 12))
+        b = rng.normal(size=(1, 12))
+        n = 80
+        feat = np.vstack([np.repeat(a, n, axis=0), np.repeat(b, n, axis=0)])
+        feat = feat + 0.01 * rng.normal(size=feat.shape)
+        feat = feat / (np.linalg.norm(feat, axis=1, keepdims=True) + 1e-9)
+
+        nov = add_mix._checkerboard_novelty(feat, half=32)
+        assert abs(int(np.argmax(nov)) - n) <= 3
+
+    def test_novelty_curve_is_none_for_empty_audio(self):
+        assert add_mix._novelty_curve(array.array("h"), ar=22050) is None
+
+    def test_novelty_curve_falls_back_to_a_list_for_short_audio(self):
+        # ~10s: too short for the 64s checkerboard kernel, so the energy-delta
+        # fallback runs. Must return a plain list, never raise.
+        short = array.array("h", [12000, -12000, 400, -400] * (22050 * 10 // 4))
+        out = add_mix._novelty_curve(short, ar=22050)
+        assert isinstance(out, list) and len(out) > 3
+        assert all(v >= 0.0 for v in out)
+
+
+class TestAssignRun:
+    def test_falls_back_to_even_split_without_a_curve(self):
+        assert add_mix._assign_run(3, 0.0, 400.0, True, None, None) == [100.0, 200.0, 300.0]
+
+    def test_one_peak_per_track_when_peaks_are_clear(self):
+        nov = [0.0] * 900
+        for p in (100, 400, 700):
+            nov[p] = 1.0
+        picks = add_mix._assign_run(3, 0.0, 900.0, True, nov, 1.0)
+        assert [round(p) for p in picks] == [100, 400, 700]
+
+    def test_adjacent_tracks_do_not_collapse_onto_one_peak(self):
+        # One dominant spike at 300 s, 2 tracks (even split 200 / 400). The greedy
+        # nudger drove both guesses onto 300; the DP keeps them a slot apart.
+        nov = [0.0] * 600
+        nov[300] = 1.0
+        picks = add_mix._assign_run(2, 0.0, 600.0, True, nov, 1.0)
+        assert picks[0] < picks[1]
+        assert picks[1] - picks[0] >= add_mix.NUDGE_MIN_GAP_FLOOR
+
+    def test_result_is_monotonic_with_many_tracks_and_sparse_peaks(self):
+        nov = [0.0] * 1200
+        for p in (150, 155, 160, 900):  # a cluster early, one late, nothing between
+            nov[p] = 1.0
+        picks = add_mix._assign_run(6, 0.0, 1200.0, True, nov, 1.0)
+        assert picks == sorted(picks)
+        assert len(set(round(p) for p in picks)) == 6
+        gaps = [b - a for a, b in zip(picks, picks[1:])]
+        assert min(gaps) >= add_mix.NUDGE_MIN_GAP_FLOOR
+
+
+class TestSnapToBeat:
+    def test_snaps_to_nearest_beat_within_tolerance(self):
+        beats = [0.0, 2.0, 4.0, 6.0, 8.0]
+        assert add_mix._snap_to_beat(4.3, beats, 0.0, 10.0, max_delta=1.0) == 4.0
+
+    def test_leaves_base_when_no_beat_is_close_enough(self):
+        assert add_mix._snap_to_beat(5.0, [0.0, 10.0], 0.0, 10.0, max_delta=1.0) == 5.0
+
+    def test_never_snaps_across_a_neighbour_bound(self):
+        # nearest beat (7.0) sits past `upper`, so the guess is left alone
+        assert add_mix._snap_to_beat(6.9, [3.0, 7.0], 0.0, 6.5, max_delta=2.0) == 6.9
+
+    def test_no_beats_is_a_noop(self):
+        assert add_mix._snap_to_beat(5.0, None, 0.0, 10.0) == 5.0
+        assert add_mix._snap_to_beat(5.0, [], 0.0, 10.0) == 5.0
