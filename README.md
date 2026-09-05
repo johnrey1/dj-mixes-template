@@ -26,21 +26,15 @@ Only `site/config.js`, the `<title>` in `site/index.html`, and `site/mixes.json`
 
 ## Using this template
 
-**Get your own copy.** This is a GitHub *template* repo — copy it, don't fork it, and don't add it as a dependency. On GitHub, click **Use this template → Create a new repository**, or:
+Use this repo as a GitHub template (**Use this template → Create a new repository**), or:
 
 ```bash
-gh repo create <your-repo> --private --template johnrey1/dj-mixes-template --clone
+gh repo create <your-repo> --public --template johnrey1/dj-mixes-template --clone
 ```
 
-(`--private` or `--public` — pick one; the command needs a visibility flag.) Then work through *Make it yours* below. Every section after this one operates on your own repo.
+Then follow *Make it yours* below.
 
-**Staying current with the template.** Only three files in a live site diverge from the template — `site/config.js`, the `<title>` in `site/index.html`, and `site/mixes.json`. Everything else (`site/app.js`, `site/styles.css`, `scripts/`) is meant to stay identical, so you pick up later fixes and features by overwriting those files:
-
-1. Grab the template fresh — **Code → Download ZIP** on the template repo, or `git clone` it to a separate directory.
-2. Copy `site/app.js`, `site/styles.css`, and `scripts/` over the versions in your repo.
-3. `git diff` to review what changed, then commit.
-
-`site/index.html` rarely changes here; if it does, apply the change by hand so you keep your own `<title>`. Never copy `site/config.js` or `site/mixes.json` from the template — those hold your branding and your mixes.
+**Updating later.** `site/app.js`, `site/styles.css`, and `scripts/` are meant to stay identical to the template. To pull in fixes, download the template again (**Code → Download ZIP**), copy those paths over yours, then `git diff` and commit. Don't copy `site/config.js`, `site/mixes.json`, or `site/index.html` — those are yours.
 
 ## Make it yours
 
