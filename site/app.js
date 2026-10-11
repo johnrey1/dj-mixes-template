@@ -158,6 +158,173 @@
     return TYPE_LABELS[mix.type] ? mix.type : 'recording';
   }
 
+  // ---- cross-posts -------------------------------------------------------
+  // A manifest entry with a `source` is a pointer to a mix hosted on another
+  // site (written by scripts/crosspost.py):
+  //   { id, source: { manifest, id, via? }, ...fields you want to override }
+  // Whatever the pointer doesn't set is filled in from the source's mixes.json
+  // at load time, so the source stays the single source of truth.
+
+  const SOURCE_RENDER_WAIT_MS = 3000; // how long the first render waits for sources
+  const SOURCE_ABORT_MS = 20000;      // give up on a source entirely after this
+
+  // The only remote fields trusted onto this page. `id` and `source` are left
+  // out on purpose: a remote entry can't take over a local id or chain onward.
+  const REMOTE_FIELDS = [
+    'title', 'date', 'type', 'artist', 'event_name', 'duration_seconds',
+    'bpm_range', 'notes', 'tracklist', 'peaks', 'audio_url',
+  ];
+
+  const sources = new Map();  // manifest URL -> { status: pending|ok|error, entries, promise }
+  const pointers = new Map(); // mix id -> the original pointer entry
+  let deepLink = null;        // { id, startAt } while a ?mix= target still awaits its source
+
+  // Returns an absolute http(s) URL string, or null. Used for everything that
+  // ends up in an href/src from remote data (javascript: etc. never gets through).
+  function safeHttpUrl(raw, base) {
+    if (typeof raw !== 'string' || !raw) return null;
+    try {
+      const u = new URL(raw, base);
+      return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function isPointer(entry) {
+    return Boolean(
+      entry && typeof entry === 'object' && entry.source && typeof entry.source === 'object'
+      && typeof entry.source.manifest === 'string' && typeof entry.source.id === 'string'
+    );
+  }
+
+  function sourceFor(manifestUrl) {
+    if (sources.has(manifestUrl)) return sources.get(manifestUrl);
+    const state = { status: 'pending', entries: null, promise: null };
+    sources.set(manifestUrl, state);
+
+    const url = safeHttpUrl(manifestUrl);
+    if (!url) {
+      state.status = 'error';
+      state.promise = Promise.resolve();
+      return state;
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), SOURCE_ABORT_MS);
+    // promise never rejects — callers read `status` instead.
+    state.promise = fetch(url, { credentials: 'omit', signal: ctrl.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        if (!Array.isArray(data)) throw new Error('not a mixes.json array');
+        state.entries = data;
+        state.status = 'ok';
+      })
+      .catch((err) => {
+        state.status = 'error';
+        console.warn(`[crosspost] could not load ${manifestUrl}:`, err);
+      })
+      .finally(() => clearTimeout(timer));
+    return state;
+  }
+
+  // Copy only well-formed, allow-listed fields out of a remote entry.
+  function cleanRemote(remote, manifestUrl) {
+    const out = {};
+    REMOTE_FIELDS.forEach((field) => {
+      const v = remote[field];
+      if (v == null) return;
+      switch (field) {
+        case 'date':
+          if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) out.date = v;
+          break;
+        case 'duration_seconds':
+          if (typeof v === 'number' && isFinite(v) && v > 0) out.duration_seconds = v;
+          break;
+        case 'tracklist':
+          if (Array.isArray(v)) out.tracklist = v;
+          break;
+        case 'peaks':
+          if (Array.isArray(v) && v.every((n) => typeof n === 'number')) out.peaks = v;
+          break;
+        case 'audio_url': {
+          const safe = safeHttpUrl(v, manifestUrl);
+          if (safe) out.audio_url = safe;
+          break;
+        }
+        default:
+          if (typeof v === 'string') out[field] = v;
+      }
+    });
+    return out;
+  }
+
+  // Remote fills in what the pointer leaves unset; the pointer's own fields win.
+  function resolvePointer(pointer) {
+    const state = sourceFor(pointer.source.manifest);
+    if (state.status === 'pending') return { ...pointer, crosspostState: 'loading' };
+
+    if (state.status === 'ok') {
+      const remote = state.entries.find((e) => e && typeof e === 'object' && e.id === pointer.source.id);
+      if (remote) {
+        const merged = cleanRemote(remote, pointer.source.manifest);
+        Object.keys(pointer).forEach((key) => {
+          if (pointer[key] != null) merged[key] = pointer[key];
+        });
+        if (merged.audio_url) {
+          merged.date = merged.date || '';
+          merged.title = merged.title || pointer.source.id;
+          return merged;
+        }
+      }
+    }
+    return { ...pointer, crosspostState: 'unavailable' };
+  }
+
+  // Resolves with the manifest list where every pointer has been replaced by its
+  // merged entry — or a loading/unavailable stub if the source didn't answer in
+  // time. Never rejects, never blocks longer than SOURCE_RENDER_WAIT_MS.
+  function resolveCrossposts(list) {
+    const withIds = list.map((m) => {
+      if (!isPointer(m)) return m;
+      const pointer = { ...m, id: m.id || m.source.id };
+      pointers.set(pointer.id, pointer);
+      return pointer;
+    });
+    const states = withIds.filter(isPointer).map((p) => sourceFor(p.source.manifest));
+    if (!states.length) return Promise.resolve(withIds);
+
+    const wait = new Promise((resolve) => setTimeout(resolve, SOURCE_RENDER_WAIT_MS));
+    return Promise.race([Promise.all(states.map((s) => s.promise)), wait])
+      .then(() => withIds.map((m) => (isPointer(m) ? resolvePointer(m) : m)));
+  }
+
+  function sourceInfo(source) {
+    const manifest = safeHttpUrl(source && source.manifest);
+    if (!manifest) return null;
+    const label = (typeof source.via === 'string' && source.via) || new URL(manifest).host;
+    const href = new URL('./?mix=' + encodeURIComponent(source.id), manifest).href;
+    return { label, href };
+  }
+
+  function buildVia(mix) {
+    const info = sourceInfo(mix.source);
+    if (!info) return null;
+    const p = document.createElement('p');
+    p.className = 'mix-track__via';
+    p.appendChild(document.createTextNode('via '));
+    const a = document.createElement('a');
+    a.href = info.href;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = `${info.label} ↗`;
+    p.appendChild(a);
+    return p;
+  }
+
   function buildFilters() {
     filtersEl.innerHTML = '';
     FILTERS.forEach((filter) => {
@@ -176,7 +343,52 @@
     });
   }
 
+  // Stand-in row for a cross-post whose source hasn't answered (yet) or doesn't
+  // list the mix any more — never silently drops the entry.
+  function buildPlaceholderTrack(mix, index) {
+    const track = document.createElement('article');
+    track.className = 'mix-track mix-track--placeholder';
+    track.style.setProperty('--i', String(index));
+    if (mix.id) track.id = 'mixtrack-' + mix.id;
+
+    const row = document.createElement('div');
+    row.className = 'mix-track__row';
+
+    const idx = document.createElement('span');
+    idx.className = 'mix-track__index';
+    idx.textContent = `N°${String(index + 1).padStart(2, '0')}`;
+    row.appendChild(idx);
+
+    const body = document.createElement('div');
+    body.className = 'mix-track__body';
+
+    const top = document.createElement('div');
+    top.className = 'mix-track__top';
+    const title = document.createElement('h2');
+    title.className = 'mix-track__title';
+    title.textContent = mix.title || mix.source.id;
+    top.appendChild(title);
+    body.appendChild(top);
+
+    const info = sourceInfo(mix.source);
+    const note = document.createElement('p');
+    note.className = 'mix-track__unavailable';
+    note.textContent = mix.crosspostState === 'loading'
+      ? `loading from ${info ? info.label : 'source'}…`
+      : 'unavailable at its source right now';
+    body.appendChild(note);
+
+    const via = buildVia(mix);
+    if (via) body.appendChild(via);
+
+    row.appendChild(body);
+    track.appendChild(row);
+    return track;
+  }
+
   function buildTrack(mix, index, autoplay) {
+    if (mix.crosspostState) return buildPlaceholderTrack(mix, index);
+
     const track = document.createElement('article');
     track.className = 'mix-track';
     track.style.setProperty('--i', String(index));
@@ -232,6 +444,9 @@
       notes.textContent = mix.notes;
       body.appendChild(notes);
     }
+
+    const via = mix.source ? buildVia(mix) : null;
+    if (via) body.appendChild(via);
 
     const actions = document.createElement('div');
     actions.className = 'mix-track__actions';
@@ -491,6 +706,16 @@
     return { seek, play: () => audio.play() };
   }
 
+  // Mixes shown under the active filter, newest first. Entries with no date
+  // (an unavailable cross-post) sort last.
+  function visibleMixes() {
+    const filtered = activeFilter === 'all'
+      ? allMixes
+      : allMixes.filter((mix) => mixType(mix) === activeFilter);
+    const day = (mix) => mix.date || '';
+    return [...filtered].sort((a, b) => (day(a) < day(b) ? 1 : day(a) > day(b) ? -1 : 0));
+  }
+
   function renderList(targetId) {
     if (currentStopFn) {
       currentStopFn();
@@ -499,11 +724,9 @@
     controllers.clear();
     listEl.innerHTML = '';
 
-    const filtered = activeFilter === 'all'
-      ? allMixes
-      : allMixes.filter((mix) => mixType(mix) === activeFilter);
+    const sorted = visibleMixes();
 
-    if (!filtered.length) {
+    if (!sorted.length) {
       const empty = document.createElement('p');
       empty.className = 'empty';
       empty.textContent = allMixes.length
@@ -513,8 +736,64 @@
       return;
     }
 
-    const sorted = [...filtered].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
     sorted.forEach((mix, index) => listEl.appendChild(buildTrack(mix, index, Boolean(targetId) && mix.id === targetId)));
+  }
+
+  // Scroll to + highlight a ?mix= target and, when ?t= was given, seek/play it.
+  function focusMix(id, startAt) {
+    const el = document.getElementById('mixtrack-' + id);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('mix-track--highlight');
+      setTimeout(() => el.classList.remove('mix-track--highlight'), 2500);
+    }
+
+    if (startAt != null) {
+      const controller = controllers.get(id);
+      if (controller) {
+        controller.seek(startAt);
+        attemptPlay(() => controller.play());
+      }
+      const tl = el && el.querySelector('.mix-track__tracklist');
+      if (tl) tl.open = true;
+    }
+  }
+
+  function renumberRows() {
+    listEl.querySelectorAll('.mix-track__index').forEach((el, i) => {
+      el.textContent = `N°${String(i + 1).padStart(2, '0')}`;
+    });
+  }
+
+  // A source that missed the first render has now answered: swap the stub row
+  // for the real one *in place*. Deliberately not renderList() — a full
+  // re-render would stop whatever the visitor is already playing.
+  function onLateSource(manifestUrl) {
+    allMixes.forEach((stub, i) => {
+      if (stub.crosspostState !== 'loading' || stub.source.manifest !== manifestUrl) return;
+      const pointer = pointers.get(stub.id);
+      if (!pointer) return;
+      const mix = resolvePointer(pointer);
+      allMixes[i] = mix;
+
+      const old = document.getElementById('mixtrack-' + mix.id);
+      if (old) old.remove();
+      const empty = listEl.querySelector('.empty');
+      if (empty) empty.remove();
+
+      const pos = visibleMixes().findIndex((m) => m.id === mix.id);
+      if (pos === -1) return; // resolved into a category the active filter hides
+
+      const focus = Boolean(deepLink) && deepLink.id === mix.id && !currentStopFn;
+      const track = buildTrack(mix, pos, focus);
+      listEl.insertBefore(track, listEl.children[pos] || null);
+      if (focus) {
+        focusMix(mix.id, deepLink.startAt);
+        deepLink = null;
+      }
+    });
+    renumberRows();
+    if (!listEl.children.length) renderList();
   }
 
   fetch('./mixes.json')
@@ -522,8 +801,9 @@
       if (!res.ok) throw new Error(`Failed to load mixes.json: ${res.status}`);
       return res.json();
     })
+    .then((mixes) => resolveCrossposts(Array.isArray(mixes) ? mixes : []))
     .then((mixes) => {
-      allMixes = Array.isArray(mixes) ? mixes : [];
+      allMixes = mixes;
 
       const params = new URLSearchParams(location.search);
       const targetId = params.get('mix');
@@ -535,28 +815,19 @@
       renderList(targetMix ? targetId : undefined);
 
       if (targetMix) {
-        const el = document.getElementById('mixtrack-' + targetMix.id);
-        if (el) {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          el.classList.add('mix-track--highlight');
-          setTimeout(() => el.classList.remove('mix-track--highlight'), 2500);
-        }
-
-        if (startAt != null) {
-          const controller = controllers.get(targetMix.id);
-          if (controller) {
-            controller.seek(startAt);
-            attemptPlay(() => controller.play());
-          }
-          const tl = el && el.querySelector('.mix-track__tracklist');
-          if (tl) tl.open = true;
-        }
+        if (targetMix.crosspostState === 'loading') deepLink = { id: targetMix.id, startAt };
+        focusMix(targetMix.id, startAt);
 
         const cleanUrl = new URL(location.href);
         cleanUrl.searchParams.delete('mix');
         cleanUrl.searchParams.delete('t');
         history.replaceState(null, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
       }
+
+      // Registered only after allMixes is set and rendered, so a source that
+      // settles in the gap can't be missed (a settled promise still fires .then).
+      new Set(allMixes.filter((m) => m.crosspostState === 'loading').map((m) => m.source.manifest))
+        .forEach((url) => sourceFor(url).promise.then(() => onLateSource(url)));
     })
     .catch((err) => {
       listEl.innerHTML = '';

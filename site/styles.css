@@ -512,3 +512,33 @@ body::before {
   .mix-track__actions { gap: 0.9rem 1.25rem; }
   .mix-filters { gap: 1.1rem; }
 }
+
+/* ---------- cross-posts (entries that point at another site's mix) ---------- */
+
+.mix-track__via {
+  margin: 0.6rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+}
+
+.mix-track__via a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--hairline-strong);
+  text-underline-offset: 3px;
+}
+
+.mix-track__via a:hover {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
+}
+
+.mix-track--placeholder .mix-track__title { color: var(--muted); }
+
+.mix-track__unavailable {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-style: italic;
+}
